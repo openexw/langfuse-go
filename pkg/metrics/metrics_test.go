@@ -165,6 +165,18 @@ func TestQuery_ToQueryStringViewSpecificMeasures(t *testing.T) {
 			},
 		},
 		{
+			name: "observations supports input and output tokens",
+			query: &Query{
+				View: ViewObservations,
+				Metrics: []Metric{
+					{Measure: MeasureInputTokens, Aggregation: "sum"},
+					{Measure: MeasureOutputTokens, Aggregation: "sum"},
+				},
+				FromTimestamp: mustParseTime("2024-01-01T00:00:00Z"),
+				ToTimestamp:   mustParseTime("2024-01-02T00:00:00Z"),
+			},
+		},
+		{
 			name: "scores numeric supports value",
 			query: &Query{
 				View:          ViewScoresNumeric,
@@ -215,28 +227,10 @@ func TestQuery_ToQueryStringMarshalError(t *testing.T) {
 
 func TestRawRowHelpers(t *testing.T) {
 	row := RawRow{
-		"name":          json.RawMessage(`"assistant"`),
-		"count_count":   json.RawMessage(`"10"`),
-		"latency_p95":   json.RawMessage(`1820.5`),
-		"fromTimestamp": json.RawMessage(`"2024-01-01T00:00:00Z"`),
-		"histogram":     json.RawMessage(`[[0,10,4]]`),
+		"name":        json.RawMessage(`"assistant"`),
+		"count_count": json.RawMessage(`"10"`),
+		"histogram":   json.RawMessage(`[[0,10,4]]`),
 	}
-
-	name, err := row.String("name")
-	require.NoError(t, err)
-	require.Equal(t, "assistant", name)
-
-	count, err := row.Int64("count_count")
-	require.NoError(t, err)
-	require.EqualValues(t, 10, count)
-
-	latency, err := row.Float64("latency_p95")
-	require.NoError(t, err)
-	require.Equal(t, 1820.5, latency)
-
-	timestamp, err := row.Time("fromTimestamp")
-	require.NoError(t, err)
-	require.Equal(t, mustParseTime("2024-01-01T00:00:00Z"), timestamp)
 
 	rawHistogram, ok := row.Raw("histogram")
 	require.True(t, ok)
@@ -246,7 +240,7 @@ func TestRawRowHelpers(t *testing.T) {
 		Name  string `json:"name"`
 		Count string `json:"count_count"`
 	}
-	err = row.Decode(&decoded)
+	err := row.Decode(&decoded)
 	require.NoError(t, err)
 	require.Equal(t, "assistant", decoded.Name)
 	require.Equal(t, "10", decoded.Count)
@@ -263,17 +257,12 @@ func TestRawRowHelpers(t *testing.T) {
 
 func TestRawRowHelpersErrors(t *testing.T) {
 	row := RawRow{
-		"name":        json.RawMessage(`123`),
-		"count_count": json.RawMessage(`"10.5"`),
+		"name": json.RawMessage(`123`),
 	}
 
-	_, err := row.String("name")
+	err := row.Decode(nil)
 	require.Error(t, err)
-	require.Contains(t, err.Error(), `decode field "name" as string failed`)
-
-	_, err = row.Int64("count_count")
-	require.Error(t, err)
-	require.Contains(t, err.Error(), `field "count_count" is not an integer`)
+	require.Contains(t, err.Error(), "'dst' is required")
 
 	_, ok := row.Raw("missing")
 	require.False(t, ok)
@@ -311,13 +300,19 @@ func TestClient_Get(t *testing.T) {
 		require.NoError(t, err)
 		require.Len(t, response.Data, 2)
 
-		name, err := response.Data[0].String("name")
+		rawName, ok := response.Data[0].Raw("name")
+		require.True(t, ok)
+		var name string
+		err = json.Unmarshal(rawName, &name)
 		require.NoError(t, err)
 		require.Equal(t, "assistant", name)
 
-		count, err := response.Data[0].Int64("count_count")
+		rawCount, ok := response.Data[0].Raw("count_count")
+		require.True(t, ok)
+		var count string
+		err = json.Unmarshal(rawCount, &count)
 		require.NoError(t, err)
-		require.EqualValues(t, 42, count)
+		require.Equal(t, "42", count)
 
 		rows, err := DecodeRows[struct {
 			Name  string `json:"name"`
@@ -345,6 +340,84 @@ func TestClient_Get(t *testing.T) {
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "'view' is required")
 		require.False(t, called)
+	})
+
+	t.Run("curl example observations metrics query", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			require.Equal(t, "/metrics", r.URL.Path)
+			require.Equal(t, "GET", r.Method)
+
+			var query Query
+			err := json.Unmarshal([]byte(r.URL.Query().Get("query")), &query)
+			require.NoError(t, err)
+			require.Equal(t, ViewObservations, query.View)
+			require.Equal(t, []Metric{
+				{Measure: MeasureTotalCost, Aggregation: "sum"},
+				{Measure: MeasureInputTokens, Aggregation: "sum"},
+				{Measure: MeasureOutputTokens, Aggregation: "sum"},
+				{Measure: MeasureCount, Aggregation: "count"},
+			}, query.Metrics)
+			require.Equal(t, []Dimension{
+				{Field: "tags"},
+				{Field: "providedModelName"},
+			}, query.Dimensions)
+			require.Empty(t, query.Filters)
+			require.Equal(t, mustParseTime("2026-04-29T00:00:00Z"), query.FromTimestamp)
+			require.Equal(t, mustParseTime("2026-04-29T23:59:59Z"), query.ToTimestamp)
+
+			w.Header().Set("Content-Type", "application/json")
+			_, err = w.Write([]byte(`{"data":[{"tags":["nutrition","meal"],"providedModelName":"gpt-4o-mini","totalCost_sum":"0.42","inputTokens_sum":"1234","outputTokens_sum":"567","count_count":"8"}]}`))
+			require.NoError(t, err)
+		}))
+		defer server.Close()
+
+		client := NewClient(resty.New().SetBaseURL(server.URL))
+		response, err := client.Get(ctx, &Query{
+			View: ViewObservations,
+			Metrics: []Metric{
+				{Measure: MeasureTotalCost, Aggregation: "sum"},
+				{Measure: MeasureInputTokens, Aggregation: "sum"},
+				{Measure: MeasureOutputTokens, Aggregation: "sum"},
+				{Measure: MeasureCount, Aggregation: "count"},
+			},
+			Dimensions: []Dimension{
+				{Field: "tags"},
+				{Field: "providedModelName"},
+			},
+			Filters:       []Filter{},
+			FromTimestamp: mustParseTime("2026-04-29T00:00:00Z"),
+			ToTimestamp:   mustParseTime("2026-04-29T23:59:59Z"),
+		})
+		require.NoError(t, err)
+		require.Len(t, response.Data, 1)
+
+		rawModelName, ok := response.Data[0].Raw("providedModelName")
+		require.True(t, ok)
+		var modelName string
+		err = json.Unmarshal(rawModelName, &modelName)
+		require.NoError(t, err)
+		require.Equal(t, "gpt-4o-mini", modelName)
+
+		rawTags, ok := response.Data[0].Raw("tags")
+		require.True(t, ok)
+		require.JSONEq(t, `["nutrition","meal"]`, string(rawTags))
+
+		rows, err := DecodeRows[struct {
+			Tags              []string `json:"tags"`
+			ProvidedModelName string   `json:"providedModelName"`
+			TotalCostSum      string   `json:"totalCost_sum"`
+			InputTokensSum    string   `json:"inputTokens_sum"`
+			OutputTokensSum   string   `json:"outputTokens_sum"`
+			CountCount        string   `json:"count_count"`
+		}](response.Data)
+		require.NoError(t, err)
+		require.Len(t, rows, 1)
+		require.Equal(t, []string{"nutrition", "meal"}, rows[0].Tags)
+		require.Equal(t, "gpt-4o-mini", rows[0].ProvidedModelName)
+		require.Equal(t, "0.42", rows[0].TotalCostSum)
+		require.Equal(t, "1234", rows[0].InputTokensSum)
+		require.Equal(t, "567", rows[0].OutputTokensSum)
+		require.Equal(t, "8", rows[0].CountCount)
 	})
 }
 

@@ -88,6 +88,7 @@ func main() {
 ```go
 import (
     "context"
+    "encoding/json"
     "fmt"
     "time"
 
@@ -118,16 +119,6 @@ func main() {
         panic(err)
     }
 
-    name, err := metricsResponse.Data[0].String("name")
-    if err != nil {
-        panic(err)
-    }
-
-    count, err := metricsResponse.Data[0].Int64("count_count")
-    if err != nil {
-        panic(err)
-    }
-
     type TraceMetricRow struct {
         Name  string `json:"name"`
         Count string `json:"count_count"`
@@ -138,7 +129,18 @@ func main() {
         panic(err)
     }
 
-    fmt.Println(name, count, rows[0].Name, rows[0].Count)
+    rawName, ok := metricsResponse.Data[0].Raw("name")
+    if !ok {
+        panic("name field not found")
+    }
+
+    var name string
+    err = json.Unmarshal(rawName, &name)
+    if err != nil {
+        panic(err)
+    }
+
+    fmt.Println(name, rows[0].Name, rows[0].Count)
 }
 ```
 
